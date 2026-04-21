@@ -36,6 +36,12 @@ mod_proxy_msrpc - Change Log
     Bugcrowd:       9bb5f540-c573-4a24-8476-1c10a89b51a0
     References:     MS-TSGU specification (ms-tsgu), MS-RPCH specification (ms-rpch)
 
+    Follow-up (same date):
+        Extended the default User-Agent check to accept MS-RDGateway/1.0 without
+        requiring explicit OutlookAnywhereUserAgents configuration. Acceptance is
+        gated on the request method already being MSRPC_M_RDG_IN or MSRPC_M_RDG_OUT,
+        so the existing MSRPC/RPC-over-HTTP path is not affected in any way.
+
     Known related issue (not in this module):
         The nDPI library contains an off-by-one error in its RPC_OUT_DATA detection:
         strncmp is called with length 11 instead of the correct 12, causing a partial

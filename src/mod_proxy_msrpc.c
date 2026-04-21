@@ -1294,8 +1294,12 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
     } else {
         int found = 0;
         if (!msrpc_conf->user_agents) {
-            /* if no user agent explicitly configured, check for the default user agent */
+            /* if no user agent explicitly configured, check protocol-native defaults */
             if (!strcasecmp(request_user_agent, "MSRPC")) {
+                found = 1;
+            } else if ((r->method_number == msrpc_methods[MSRPC_M_RDG_IN] ||
+                        r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) &&
+                       !strcasecmp(request_user_agent, "MS-RDGateway/1.0")) {
                 found = 1;
             }
         } else {
