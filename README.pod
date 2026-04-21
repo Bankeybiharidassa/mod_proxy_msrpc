@@ -1,6 +1,6 @@
 =head1 NAME
 
-mod_proxy_msrpc - Apache module for Outlook Anywhere support in reverse proxy setups
+mod_proxy_msrpc - Apache module for Outlook Anywhere and RDS Gateway support in reverse proxy setups
 
 =head1 SYNOPSIS
 
@@ -20,7 +20,8 @@ Enable the module inside a <VirtualHost> configuration container (or globally):
 =head1 DESCRIPTION
 
 This module intends to make Apache httpd work in a reverse proxy setup
-in front of a MS Exchange server offering Outlook Anywhere services.
+in front of a MS Exchange server offering Outlook Anywhere services,
+or in front of a Microsoft RDS Gateway (Remote Desktop Gateway).
 Without it, Apache would block any Outlook Anywhere requests for reasons
 documented very well in https://issues.apache.org/bugzilla/show_bug.cgi?id=40029.
 
@@ -34,6 +35,68 @@ As soon as the initial handshake completed, i.e. Exchange accepted the
 connecting client, the mod_proxy_msrpc module switches into tunnel mode and
 forwards all data from client to server and vice versa.
 
+=head1 SUPPORTED HTTP METHOD VERBS
+
+The module handles the following non-standard HTTP method verbs:
+
+=over 4
+
+=item B<RPC_IN_DATA>
+
+Client-to-server data channel for Outlook Anywhere (MS-RPCH / RPC over HTTP).
+
+=item B<RPC_OUT_DATA>
+
+Server-to-client data channel for Outlook Anywhere (MS-RPCH / RPC over HTTP).
+
+=item B<RDG_IN_DATA>
+
+Client-to-server data channel for Microsoft RDS Gateway (MS-TSGU, Windows Server 2012+).
+Note the counterintuitive naming per the MS-TSGU specification: RDG_IN_DATA carries
+data flowing IN to the gateway from the client.
+
+=item B<RDG_OUT_DATA>
+
+Server-to-client data channel for Microsoft RDS Gateway (MS-TSGU, Windows Server 2012+).
+RDG_OUT_DATA carries data flowing OUT from the gateway to the client.
+
+=back
+
+=head1 MICROSOFT RDS GATEWAY SUPPORT
+
+Since version 1.x this module supports Microsoft RDS Gateway (Remote Desktop Gateway)
+in addition to the original Outlook Anywhere / RPC over HTTP support.
+
+RDS Gateway uses the MS-TSGU protocol specification and is used to broker Remote
+Desktop Protocol (RDP) connections through HTTPS.
+The gateway client establishes two HTTP channels using the non-standard verbs
+B<RDG_OUT_DATA> (server-to-client) and B<RDG_IN_DATA> (client-to-server), which
+map directly to the dual-channel model used by Outlook Anywhere
+(B<RPC_OUT_DATA> and B<RPC_IN_DATA> respectively).
+
+This feature enables Apache-based WAF/reverse proxy deployments (such as Sophos UTM
+and SFOS Web Application Firewall) to proxy RDS Gateway sessions from Windows Server
+2012 and later.
+
+References:
+
+=over 4
+
+=item * MS-TSGU specification: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tsgu
+
+=item * RDG_IN_DATA: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tsgu/87004f61-03c6-4f3b-b230-5b5b2c0ef820
+
+=item * RDG_OUT_DATA: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tsgu/6ea45086-c98d-4d5a-ac8c-fb0decc5d2c1
+
+=back
+
+B<Configuration note:> RDS Gateway clients send C<User-Agent: MS-RDGateway/1.0>.
+The module's default User-Agent filter accepts only C<MSRPC>; to support RDS Gateway
+sessions add the following to your virtual host configuration:
+
+    OutlookAnywhereUserAgent MSRPC
+    OutlookAnywhereUserAgent MS-RDGateway/1.0
+
 =head1 CAVEATS
 
 Some older Exchange versions (e.g. Exchange Server 2007) are known to sync
@@ -43,6 +106,25 @@ For these Exchange versions functionality of this module is limited to
 enabling receiving and sending mail.
 I.e. Address book and calendar synchronization doesn't work with these Exchange
 versions.
+
+B<RDS Gateway User-Agent:> RDS Gateway clients do not send C<User-Agent: MSRPC>.
+See the B<MICROSOFT RDS GATEWAY SUPPORT> section above for the required configuration.
+
+=head1 KNOWN ISSUES FIXED
+
+=over 4
+
+=item * B<RDG_IN_DATA / RDG_OUT_DATA not registered (fixed 19 April 2026)>
+
+The module originally registered only C<RPC_IN_DATA> and C<RPC_OUT_DATA>.
+The C<RDG_IN_DATA> and C<RDG_OUT_DATA> verbs used by Microsoft RDS Gateway
+(MS-TSGU, Windows Server 2012+) were never registered via C<ap_method_register()>.
+This caused Apache to decline all RDS Gateway requests with the log message:
+C<declining due to bad method: RDG_OUT_DATA>.
+The defect was present since UTM 9.1 (May 2013) — approximately 13 years undetected.
+Reported by Arno van der Veen / itssecured.nl (Sophos case 03152113).
+
+=back
 
 =head1 DIAGNOSTICS
 
@@ -67,6 +149,10 @@ passthrough for the Sophos UTM's Web Application Firewall.
 It was first released as part of UTM 9.1 in May 2013.
 Sophos generously agreed to contribute the source code to the open source
 community under the terms of the Apache License 2.0.
+
+Support for Microsoft RDS Gateway (MS-TSGU) via C<RDG_IN_DATA> and
+C<RDG_OUT_DATA> was added in April 2026 following a defect report by
+Arno van der Veen / itssecured.nl (Sophos support case 03152113).
 
 =head1 AUTHOR
 
