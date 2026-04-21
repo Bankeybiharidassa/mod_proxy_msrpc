@@ -108,7 +108,11 @@ if [[ -n "$GLIBC_MAX" ]] && [[ "$(printf '%s\n' "$GLIBC_MAX" '2.27' | sort -V | 
 fi
 
 mapfile -t needed < <(readelf -d "$MODULE_SO" | awk -F'[][]' '/NEEDED/ {print $2}')
+<<<<<<< codex/build-sfos-source-tree-with-apache-modules-r8ge8h
+allowed=(libapr-1.so.0 libaprutil-1.so.0 libpthread.so.0 libc.so.6 libdl.so.2 libcrypt.so.1 libuuid.so.1)
+=======
 allowed=(libapr-1.so.0 libaprutil-1.so.0 libpthread.so.0 libc.so.6 libdl.so.2 libcrypt.so.1)
+>>>>>>> master
 for lib in "${needed[@]}"; do
   ok=0
   for a in "${allowed[@]}"; do
@@ -118,7 +122,11 @@ for lib in "${needed[@]}"; do
     fi
   done
   if [[ $ok -ne 1 ]]; then
+<<<<<<< codex/build-sfos-source-tree-with-apache-modules-r8ge8h
+    echo "ERROR: unexpected NEEDED entry: $lib (allowed: ${allowed[*]})" >&2
+=======
     echo "ERROR: unexpected NEEDED entry: $lib" >&2
+>>>>>>> master
     exit 1
   fi
 done
