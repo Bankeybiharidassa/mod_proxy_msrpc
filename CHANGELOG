@@ -1,0 +1,43 @@
+mod_proxy_msrpc - Change Log
+============================
+
+2026-04-19  Arno van der Veen <arno@itssecured.nl>
+
+    FIX: RDG_IN_DATA / RDG_OUT_DATA not registered (Defect present since UTM 9.1, May 2013)
+
+    Defect:
+        The module registered only RPC_IN_DATA and RPC_OUT_DATA via ap_method_register().
+        The RDG_IN_DATA and RDG_OUT_DATA HTTP method verbs used by Microsoft RDS Gateway
+        (MS-TSGU protocol specification, Windows Server 2012+) were never registered.
+        As a result, Apache declined all RDS Gateway tunnel requests with the log message:
+            [proxy_msrpc:debug] mod_proxy_msrpc.c(604):
+            declining due to bad method: RDG_OUT_DATA
+
+    Impact:
+        RDS Gateway sessions published through an Apache-based WAF/reverse proxy
+        (including Sophos UTM and SFOS Web Application Firewall) failed unconditionally.
+        All affected deployments from UTM 9.1 (May 2013) to SFOS v22.0.0 GA-Build411
+        (April 2026) were unable to proxy RDS Gateway connections.
+
+    Fix:
+        - Added MSRPC_M_RDG_IN and MSRPC_M_RDG_OUT to the method enum in mod_proxy_msrpc.c
+        - Registered RDG_IN_DATA and RDG_OUT_DATA via ap_method_register() in the init hook
+        - Extended all handler conditionals (method check, PDU parsing, PDU length
+          validation, session state, tunnel sync) to cover both RDG verb pairs alongside
+          the existing RPC verb pairs
+
+    Evidence:
+        Live debug log from SFOS v22.0.0 GA-Build411 (17 April 2026):
+            [proxy_msrpc:debug] mod_proxy_msrpc.c(604):
+            declining due to bad method: RDG_OUT_DATA
+
+    Reported by:    Arno van der Veen / itssecured.nl
+    Sophos case:    03152113
+    Bugcrowd:       9bb5f540-c573-4a24-8476-1c10a89b51a0
+    References:     MS-TSGU specification (ms-tsgu), MS-RPCH specification (ms-rpch)
+
+    Known related issue (not in this module):
+        The nDPI library contains an off-by-one error in its RPC_OUT_DATA detection:
+        strncmp is called with length 11 instead of the correct 12, causing a partial
+        match against the 11-character string "RPC_OUT_DAT". This is a separate defect
+        in nDPI and does not affect mod_proxy_msrpc.

@@ -44,10 +44,12 @@ APLOG_USE_MODULE(proxy_msrpc);
 
 module AP_MODULE_DECLARE_DATA proxy_msrpc_module;
 
-/* methods used by Outlook Anywhere */
+/* methods used by Outlook Anywhere (MS-RPCH) and RDS Gateway (MS-TSGU) */
 enum {
     MSRPC_M_DATA_IN = 0,
     MSRPC_M_DATA_OUT,
+    MSRPC_M_RDG_IN,
+    MSRPC_M_RDG_OUT,
     MSRPC_M_LAST
 };
 
@@ -367,8 +369,10 @@ int proxy_msrpc_init(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
     apr_pool_cleanup_register(p, (void*)s, msrpc_session_cache_destroy, apr_pool_cleanup_null);
 
     /* Register used HTTP methods */
-    msrpc_methods[MSRPC_M_DATA_IN] = ap_method_register(p, "RPC_IN_DATA");
+    msrpc_methods[MSRPC_M_DATA_IN]  = ap_method_register(p, "RPC_IN_DATA");
     msrpc_methods[MSRPC_M_DATA_OUT] = ap_method_register(p, "RPC_OUT_DATA");
+    msrpc_methods[MSRPC_M_RDG_IN]   = ap_method_register(p, "RDG_IN_DATA");
+    msrpc_methods[MSRPC_M_RDG_OUT]  = ap_method_register(p, "RDG_OUT_DATA");
 
     return OK;
 }
@@ -650,7 +654,8 @@ int proxy_msrpc_tunnel(apr_pool_t *p, request_rec *r,
      * switch the Outlook Session to tunnel mode. This means for RPC_IN_DATA
      * requests we have to check the Outlook Session state, for RPC_OUT_DATA
      * we did this already before calling this function. */
-    int check_session_state = (r->method_number == msrpc_methods[MSRPC_M_DATA_IN]) ? 1 : 0;
+    int check_session_state = (r->method_number == msrpc_methods[MSRPC_M_DATA_IN] ||
+                               r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) ? 1 : 0;
     while (1) { /* Infinite loop until error (one side closes the connection) */
         apr_int32_t pollcnt;
         const apr_pollfd_t *signalled;
@@ -911,9 +916,11 @@ static int proxy_msrpc_read_and_parse_initial_pdu(request_rec *r, proxy_msrpc_re
                   r->method, rdata->initial_pdu_offset, rdata->outlook_session);
 
     rv = HTTP_INTERNAL_SERVER_ERROR;
-    if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN]) {
+    if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN] ||
+        r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) {
         rv = proxy_msrpc_register_outlook_session(r, rdata);
-    } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT]) {
+    } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT] ||
+               r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
         rv = OK;
     }
     return rv;
@@ -1272,7 +1279,9 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
 
     /* does the method number match? */
     if ((r->method_number != msrpc_methods[MSRPC_M_DATA_IN]) &&
-        (r->method_number != msrpc_methods[MSRPC_M_DATA_OUT])) {
+        (r->method_number != msrpc_methods[MSRPC_M_DATA_OUT]) &&
+        (r->method_number != msrpc_methods[MSRPC_M_RDG_IN]) &&
+        (r->method_number != msrpc_methods[MSRPC_M_RDG_OUT])) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining due to bad method: %s", r->method);
         return DECLINED;
     }
@@ -1406,13 +1415,14 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
         if (status != OK) {
             goto cleanup;
         }
-        /* body length of RPC_OUT_DATA requests needs to match PDU length */
-        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT]) {
+        /* body length of OUT channel requests needs to match PDU length */
+        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT] ||
+            r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
             if (rdata->body_length != rdata->initial_pdu_offset) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                              "MSRPC PDU length %llu of RPC_OUT_DATA request "
+                              "MSRPC PDU length %llu of %s request "
                               "does not match request body length %lld",
-                              rdata->initial_pdu_offset, rdata->body_length);
+                              rdata->initial_pdu_offset, r->method, rdata->body_length);
                 return HTTP_BAD_REQUEST;
             }
         }
@@ -1467,11 +1477,12 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
                       "%s: initial PDU successfully sent to server %pI (%s)",
                       r->method, worker->cp->addr, worker->s->hostname);
 
-        /* synchronize with RPC_DATA_IN request */
+        /* synchronize IN/OUT channel requests (RPC_IN_DATA/RDG_IN_DATA waits for OUT channel) */
         // TODO: Replace hard-coded path by something configuration depending
         char *sync_key = apr_pstrcat(r->pool, "/tmp/msrpc_tunnel_", rdata->outlook_session, ".sync", NULL);
 
-        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT]) {
+        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT] ||
+            r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
             /* Wait for "HTTP/1.1 200 OK" message from server */
             // TODO: proxy_msrpc_read_server_response() should NOT send data to the client so we can
             //       return propper HTTP errors when backend server was ok and 'we' failed. See below
@@ -1516,7 +1527,8 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
                    with the 'cleanup' label. */
                 break;
             }
-        } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN]) {
+        } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN] ||
+                   r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) {
             int8_t sync_state = msrpc_sync_wait(sync_key, 5000);
             if (sync_state == SESSION_TUNNEL) {
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
