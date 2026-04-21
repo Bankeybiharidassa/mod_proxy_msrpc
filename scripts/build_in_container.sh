@@ -42,7 +42,7 @@ make -j"$(nproc)"
 make install
 
 cd "$WORK_DIR/apr-util-${APR_UTIL_VERSION}"
-./configure --prefix="$PREFIX" --with-apr="$PREFIX" --with-expat=builtin
+./configure --prefix="$PREFIX" --with-apr="$PREFIX" --with-expat=/usr
 make -j"$(nproc)"
 make install
 
@@ -56,18 +56,22 @@ cd "$WORK_DIR/httpd-${HTTPD_VERSION}"
 make -j"$(nproc)"
 make install
 
-MMN_MAJOR="$(awk '/MODULE_MAGIC_NUMBER_MAJOR/ {print $3}' "$PREFIX/include/ap_mmn.h")"
-MMN_MINOR="$(awk '/MODULE_MAGIC_NUMBER_MINOR/ {print $3}' "$PREFIX/include/ap_mmn.h")"
+MMN_MAJOR="$(grep -E "^#define[[:space:]]+MODULE_MAGIC_NUMBER_MAJOR[[:space:]]+[0-9]+" "$PREFIX/include/ap_mmn.h" | awk '{print $3}')"
+MMN_MINOR="$(grep -E "^#define[[:space:]]+MODULE_MAGIC_NUMBER_MINOR[[:space:]]+[0-9]+" "$PREFIX/include/ap_mmn.h" | awk '{print $3}')"
 if [[ "$MMN_MAJOR:$MMN_MINOR" != "20120211:141" ]]; then
   echo "ERROR: MMN mismatch; expected 20120211:141 got ${MMN_MAJOR}:${MMN_MINOR}" >&2
   exit 1
 fi
 
+"$PREFIX/bin/apxs" -q HTTPD_VERSION | grep -Fx "2.4.64" >/dev/null
+"$PREFIX/bin/apxs" -q APR_VERSION | grep -Fx "1.7.2" >/dev/null
+
 cd "$SRC_DIR"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 if [[ -x ./autogen.sh ]]; then
   ./autogen.sh
 fi
-./configure --with-apxs="$PREFIX/bin/apxs"
+APXS="$PREFIX/bin/apxs" ./configure
 make -j"$(nproc)"
 
 MODULE_SO="$(find "$SRC_DIR" -path '*/.libs/mod_proxy_msrpc.so' | head -n1)"
@@ -102,6 +106,22 @@ if [[ -n "$GLIBC_MAX" ]] && [[ "$(printf '%s\n' "$GLIBC_MAX" '2.27' | sort -V | 
   echo "ERROR: GLIBC ceiling violated (max $GLIBC_MAX)" >&2
   exit 1
 fi
+
+mapfile -t needed < <(readelf -d "$MODULE_SO" | awk -F'[][]' '/NEEDED/ {print $2}')
+allowed=(libapr-1.so.0 libaprutil-1.so.0 libpthread.so.0 libc.so.6 libdl.so.2 libcrypt.so.1)
+for lib in "${needed[@]}"; do
+  ok=0
+  for a in "${allowed[@]}"; do
+    if [[ "$lib" == "$a" ]]; then
+      ok=1
+      break
+    fi
+  done
+  if [[ $ok -ne 1 ]]; then
+    echo "ERROR: unexpected NEEDED entry: $lib" >&2
+    exit 1
+  fi
+done
 
 cp "$MODULE_SO" "$OUT_DIR/mod_proxy_msrpc.so"
 
