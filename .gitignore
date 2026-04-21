@@ -11,3 +11,4 @@ Makefile
 *.lo
 *.slo
 *.o
+/out/
