@@ -90,12 +90,10 @@ References:
 
 =back
 
-B<Configuration note:> RDS Gateway clients send C<User-Agent: MS-RDGateway/1.0>.
-The module's default User-Agent filter accepts only C<MSRPC>; to support RDS Gateway
-sessions add the following to your virtual host configuration:
-
-    OutlookAnywhereUserAgent MSRPC
-    OutlookAnywhereUserAgent MS-RDGateway/1.0
+B<User-Agent:> RDS Gateway clients send C<User-Agent: MS-RDGateway/1.0>.
+The module accepts this by default — no additional configuration is required.
+If you use the C<OutlookAnywhereUserAgents> directive to restrict accepted
+User-Agents, add C<MS-RDGateway/1.0> to the list alongside C<MSRPC>.
 
 =head1 CAVEATS
 
@@ -107,8 +105,6 @@ enabling receiving and sending mail.
 I.e. Address book and calendar synchronization doesn't work with these Exchange
 versions.
 
-B<RDS Gateway User-Agent:> RDS Gateway clients do not send C<User-Agent: MSRPC>.
-See the B<MICROSOFT RDS GATEWAY SUPPORT> section above for the required configuration.
 
 =head1 KNOWN ISSUES FIXED
 
