@@ -1,0 +1,19 @@
+FROM ubuntu:18.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc g++ make pkg-config \
+    autoconf automake libtool m4 \
+    wget ca-certificates git patch \
+    libpcre3-dev libssl-dev libexpat1-dev libxml2-dev \
+    file binutils bzip2 xz-utils tar perl && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash build && \
+    mkdir -p /src /out /work && chown -R build:build /src /out /work
+
+USER build
+WORKDIR /src
+
+CMD ["bash", "-lc", "ulimit -n 65535; exec bash"]
