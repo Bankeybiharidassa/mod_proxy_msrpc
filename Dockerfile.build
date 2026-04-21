@@ -7,8 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     autoconf automake libtool m4 \
     wget ca-certificates git patch \
     libpcre3-dev libssl-dev libexpat1-dev libxml2-dev \
+<<<<<<< codex/build-sfos-source-tree-with-apache-modules-r8ge8h
     file binutils bzip2 xz-utils tar perl gawk \
     check uuid-dev && \
+=======
+    file binutils bzip2 xz-utils tar perl && \
+>>>>>>> master
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash build && \

@@ -121,8 +121,9 @@ The C<RDG_IN_DATA> and C<RDG_OUT_DATA> verbs used by Microsoft RDS Gateway
 (MS-TSGU, Windows Server 2012+) were never registered via C<ap_method_register()>.
 This caused Apache to decline all RDS Gateway requests with the log message:
 C<declining due to bad method: RDG_OUT_DATA>.
-The defect was present since UTM 9.1 (May 2013) — approximately 13 years undetected.
+The defect was present since XG V14
 Reported by Arno van der Veen / itssecured.nl (Sophos case 03152113).
+Sophos did decide not to fix this issue.
 
 =back
 
