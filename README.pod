@@ -4,6 +4,14 @@ mod_proxy_msrpc - Apache module for Outlook Anywhere and RDS Gateway support in 
 
 =head1 SYNOPSIS
 
+Use the verified Sophos XGS lab module:
+
+    module/mod_proxy_msrpc.so
+
+Install and validate it with:
+
+    docs/mod_proxy_msrpc_xgs_install.md
+
 Build the module:
 
     ./configure
@@ -16,6 +24,70 @@ Load the module:
 Enable the module inside a <VirtualHost> configuration container (or globally):
 
     OutlookAnywherePassthrough On
+
+=head1 CURRENT SOPHOS XGS RDGHTTP LAB BUILD
+
+This repository includes the latest lab-verified source, documentation, and
+prebuilt Apache module for Sophos XGS/SFOS testing.
+
+=over 4
+
+=item * Source:
+
+    src/mod_proxy_msrpc.c
+
+=item * Prebuilt tested module:
+
+    module/mod_proxy_msrpc.so
+
+=item * XGS install and validation guide:
+
+    docs/mod_proxy_msrpc_xgs_install.md
+
+=back
+
+The included module was built for the tested Sophos XGS/SFOS Apache target and
+has MD5:
+
+    0d33bea4d30d0eea5de5c064c8ae3ae7
+
+The final lab verification kept the original RPC-HTTP path working and added
+classic RDGHTTP handling for forced HTTP/extended-auth clients.
+
+Verified behavior:
+
+=over 4
+
+=item * C<RPC_IN_DATA> / C<RPC_OUT_DATA>
+
+Existing MSRPC/RPC-HTTP handling remains the compatibility path.
+
+=item * C<RDG_OUT_DATA> / C<RDG_IN_DATA>
+
+Forwarded as RD Gateway HTTP tunnel traffic without parsing the payload as RPC
+PDUs.
+
+=item * C<RDG-Auth-Scheme: SSPI_NTLM>
+
+The module suppresses the outer C<Authorization> header toward the backend and
+lets RD Gateway handle extended authentication.
+
+=item * WebSocket-capable RDGHTTP clients
+
+The module downgrades upstream WebSocket upgrade attempts to classic RDGHTTP by
+removing C<Upgrade> and C<Sec-WebSocket-*> headers and forwarding
+C<Connection: Keep-Alive>.
+
+=back
+
+The WebSocket downgrade is intentional. This module does not implement a
+bidirectional WebSocket frame tunnel; forwarding a backend C<101 Switching
+Protocols> response without full upgraded-transport handling is not sufficient.
+
+Default MSTSC/default FreeRDP HTTP may still choose Negotiate rather than RDG
+extended C<SSPI_NTLM>. The verified HTTP path is forced RDGHTTP/HTTP with
+extended SSPI_NTLM authentication. See the XGS install guide for the exact
+validation notes and known caveats.
 
 =head1 DESCRIPTION
 
@@ -95,6 +167,38 @@ The module accepts this by default — no additional configuration is required.
 If you use the C<OutlookAnywhereUserAgents> directive to restrict accepted
 User-Agents, add C<MS-RDGateway/1.0> to the list alongside C<MSRPC>.
 
+For the current Sophos XGS lab build, C<RDG_IN_DATA> and C<RDG_OUT_DATA> are not
+treated as RPC PDUs. They use a separate RDGHTTP forwarding path that preserves
+the original RPC implementation for Outlook Anywhere and RPC-HTTP clients.
+
+=head1 USING OR BUILDING FROM A FRESH CLONE
+
+The repository is intended to be useful in two ways:
+
+=over 4
+
+=item * Use the included lab-tested module for Sophos XGS/SFOS validation.
+
+=item * Build from source for your own Apache reverse proxy environment.
+
+=back
+
+A normal source build uses the classic autotools flow:
+
+    ./configure
+    make
+
+The build host needs Apache httpd/APR development headers and the matching APXS
+toolchain for the Apache version that will load the module. The module ABI,
+Apache module magic number, APR/APR-util versions, and platform libraries matter,
+so anyone using it outside the provided Sophos XGS lab artifact should build it
+inside their own target-compatible development environment.
+
+The included prebuilt module is provided so another tester can clone the
+repository, inspect the exact source and documentation, and install the verified
+Sophos XGS/SFOS test artifact. Sophos or any other Apache reverse proxy vendor
+should build from source in their own matching development environment.
+
 =head1 CAVEATS
 
 Some older Exchange versions (e.g. Exchange Server 2007) are known to sync
@@ -150,6 +254,10 @@ community under the terms of the Apache License 2.0.
 Support for Microsoft RDS Gateway (MS-TSGU) via C<RDG_IN_DATA> and
 C<RDG_OUT_DATA> was added in April 2026 following a defect report by
 Arno van der Veen / itssecured.nl (Sophos support case 03152113).
+
+The Sophos XGS RDGHTTP lab build was updated in June 2026 to handle RDGHTTP as
+HTTP tunnel traffic rather than RPC tunnel traffic, including extended
+C<SSPI_NTLM> authentication handling and WebSocket upgrade downgrade behavior.
 
 =head1 AUTHOR
 

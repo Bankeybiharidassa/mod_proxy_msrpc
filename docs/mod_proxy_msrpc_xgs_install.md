@@ -19,20 +19,17 @@ The WebSocket downgrade is deliberate. The module does not implement a bidirecti
 - Appliance: XG_Test / SFV4C6 lab VM
 - Apache module target: Apache 2.4.64, glibc 2.27 build
 - Active tested module MD5: `0d33bea4d30d0eea5de5c064c8ae3ae7`
-- Active tested module file in this package: `modules/recommended/mod_proxy_msrpc_rdg_ws_downgrade1.so`
+- Active tested module file in this repository: `module/mod_proxy_msrpc.so`
 - WAF rule under test: rule id `8`, rule name `rdgw`
 - Gateway public name under test: `remote.itsecured.nl`
 - Backend RD Gateway under test: `172.16.17.30`
 
-## Package layout
+## Repository layout
 
-- `source/mod_proxy_msrpc/`: source tree used to build the module.
-- `modules/recommended/`: final verified `.so` for installation.
-- `modules/history/`: intermediate lab module variants kept for comparison and regression analysis.
+- `src/`: source tree for the Apache module.
+- `module/mod_proxy_msrpc.so`: final verified Sophos XGS/SFOS lab `.so` for installation.
 - `docs/`: installation, validation, and implementation notes.
-- `tools/`: helper scripts used during lab validation.
-- `evidence/`: final FreeRDP logs and screenshots proving RPC-HTTP and RDGHTTP operation.
-- `protocol/`: local protocol/specification notes used during investigation.
+- `README.pod`: project overview, supported methods, build expectations, and caveats.
 
 ## Install on XGS
 
@@ -47,7 +44,7 @@ Do not install from the normal device console; the Advanced Shell is required fo
 Copy the module to the XGS first:
 
 ```sh
-scp modules/recommended/mod_proxy_msrpc_rdg_ws_downgrade1.so admin@192.168.45.138:/tmp/mod_proxy_msrpc.so
+scp module/mod_proxy_msrpc.so admin@192.168.45.138:/tmp/mod_proxy_msrpc.so
 ```
 
 Then run the following from Advanced Shell:
@@ -130,12 +127,9 @@ $env:RDP_PASS='REDACTED'
   -HttpMode http-extauth
 ```
 
-Final proof from the lab:
-
-- RPC log: `evidence/xfreerdp_rpc_20260621_202320.log`
-- RPC screenshot: `evidence/verify_rpc_20260621_202311.png`
-- HTTP log: `evidence/xfreerdp_http-extauth_20260621_202357.log`
-- HTTP screenshot: `evidence/verify_http-extauth_20260621_202357.png`
+Final proof from the lab was captured as FreeRDP logs and screenshots during
+the June 2026 validation run. Those files are not required to build or install
+the module from this source repository.
 
 RPC success markers:
 
@@ -190,24 +184,21 @@ For a production-quality default MSTSC path, validate RDGW certificate names, SP
 
 ## Build notes
 
-The final module was built from `source/mod_proxy_msrpc/` using the Docker build harness in that source tree:
+A normal source build uses the classic Apache module/autotools path:
 
-```powershell
-$env:DOCKER_CONFIG='D:\Users\ArnovanderVeen\Documents\Sophos XGS\.docker-codex'
-docker run --rm `
-  -v D:\github\mod_proxy_msrpc:/src `
-  -v D:\github\mod_proxy_msrpc\out:/out `
-  mod-proxy-msrpc-sfos-build
+```sh
+./configure
+make
 ```
 
-The resulting module was copied from:
+The builder is responsible for using a development environment that matches the
+target Apache reverse proxy. The Apache module ABI, module magic number,
+APR/APR-util versions, and platform libraries must match the environment that
+will load `mod_proxy_msrpc.so`.
+
+For Sophos XGS/SFOS lab validation, this repository already includes the tested
+artifact:
 
 ```text
-D:\github\mod_proxy_msrpc\out\mod_proxy_msrpc-2.4.64-glibc2.27-nogit\mod_proxy_msrpc.so
-```
-
-In this package, the recommended built artifact is:
-
-```text
-modules/recommended/mod_proxy_msrpc_rdg_ws_downgrade1.so
+module/mod_proxy_msrpc.so
 ```
