@@ -12,3 +12,6 @@ Makefile
 *.slo
 *.o
 /out/
+scripts/build_in_container.sh
+Dockerfile.build
+.claude/worktrees/pedantic-davinci-004542/
