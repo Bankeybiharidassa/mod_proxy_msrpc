@@ -240,7 +240,7 @@ be written to the usual Apache log destinations (e.g. to file error.log).
 
 Please use the GitHub issue tracker to check for any pending issues or to report any new bugs.
 
-https://github.com/bombadil/mod_proxy_msrpc/issues
+https://github.com/Bankeybiharidassa/mod_proxy_msrpc/issues
 
 =head1 HISTORY
 
