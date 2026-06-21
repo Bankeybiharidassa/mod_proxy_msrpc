@@ -44,7 +44,7 @@ APLOG_USE_MODULE(proxy_msrpc);
 
 module AP_MODULE_DECLARE_DATA proxy_msrpc_module;
 
-/* methods used by Outlook Anywhere (MS-RPCH) and RDS Gateway (MS-TSGU) */
+/* methods used by Outlook Anywhere and Remote Desktop Gateway */
 enum {
     MSRPC_M_DATA_IN = 0,
     MSRPC_M_DATA_OUT,
@@ -104,6 +104,29 @@ typedef struct _msrpc_backend {
     proxy_conn_rec *conn;
     server_rec *server;
 } msrpc_backend_t;
+
+static int proxy_msrpc_is_rdghttp_method(const request_rec *r)
+{
+    return (r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) ||
+           (r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]);
+}
+
+static const char *proxy_msrpc_log_value(request_rec *r,
+                                         const char *key,
+                                         const char *value)
+{
+    if (!strcasecmp(key, "Authorization")) {
+        const char *auth_param = strchrnul(value, ' ');
+        if (auth_param > value) {
+            return apr_pstrcat(r->pool,
+                               apr_pstrndup(r->pool, value, auth_param - value),
+                               " <redacted>", NULL);
+        }
+        return "<redacted>";
+    }
+
+    return value;
+}
 
 static
 int proxy_msrpc_precfg(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptmp)
@@ -369,10 +392,10 @@ int proxy_msrpc_init(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
     apr_pool_cleanup_register(p, (void*)s, msrpc_session_cache_destroy, apr_pool_cleanup_null);
 
     /* Register used HTTP methods */
-    msrpc_methods[MSRPC_M_DATA_IN]  = ap_method_register(p, "RPC_IN_DATA");
+    msrpc_methods[MSRPC_M_DATA_IN] = ap_method_register(p, "RPC_IN_DATA");
     msrpc_methods[MSRPC_M_DATA_OUT] = ap_method_register(p, "RPC_OUT_DATA");
-    msrpc_methods[MSRPC_M_RDG_IN]   = ap_method_register(p, "RDG_IN_DATA");
-    msrpc_methods[MSRPC_M_RDG_OUT]  = ap_method_register(p, "RDG_OUT_DATA");
+    msrpc_methods[MSRPC_M_RDG_IN] = ap_method_register(p, "RDG_IN_DATA");
+    msrpc_methods[MSRPC_M_RDG_OUT] = ap_method_register(p, "RDG_OUT_DATA");
 
     return OK;
 }
@@ -485,6 +508,51 @@ int proxy_msrpc_pass_brigade(apr_bucket_alloc_t *bucket_alloc, request_rec *r,
     return OK;
 }
 
+static void proxy_msrpc_drain_rdghttp_auth_body(request_rec *r,
+                                                proxy_conn_rec *backend,
+                                                apr_bucket_brigade *bb)
+{
+    apr_pollset_t *pollset = NULL;
+    apr_pollfd_t pollfd;
+    apr_status_t rv;
+    conn_rec *origin = backend->connection;
+
+    if (apr_pollset_create(&pollset, 1, r->pool, 0) != APR_SUCCESS) {
+        return;
+    }
+
+    pollfd.p = r->pool;
+    pollfd.desc_type = APR_POLL_SOCKET;
+    pollfd.reqevents = APR_POLLIN;
+    pollfd.desc.s = ap_get_conn_socket(origin);
+    pollfd.client_data = NULL;
+    if (apr_pollset_add(pollset, &pollfd) != APR_SUCCESS) {
+        return;
+    }
+
+    while (1) {
+        apr_int32_t pollcnt = 0;
+        const apr_pollfd_t *signalled = NULL;
+
+        rv = apr_pollset_poll(pollset, 2000000, &pollcnt, &signalled);
+        if (APR_STATUS_IS_TIMEUP(rv) || rv != APR_SUCCESS || pollcnt <= 0) {
+            break;
+        }
+
+        rv = proxy_msrpc_process_data(r, origin, r->connection, bb,
+                                      MSRPC_SERVER_TO_CLIENT);
+        if (rv != APR_SUCCESS) {
+            break;
+        }
+
+        if (signalled[0].rtnevents & (APR_POLLHUP | APR_POLLERR)) {
+            break;
+        }
+    }
+
+    apr_brigade_cleanup(bb);
+}
+
 static int proxy_msrpc_send_request_headers(request_rec *r, char *url,
                                                apr_bucket_brigade *bb,
                                                proxy_conn_rec *p_conn,
@@ -501,7 +569,31 @@ static int proxy_msrpc_send_request_headers(request_rec *r, char *url,
     const apr_array_header_t *headers_in_array = apr_table_elts(r->headers_in);
     const apr_table_entry_t *headers_in = (const apr_table_entry_t *)headers_in_array->elts;
     const char *client_auth = NULL;
+    const char *rdg_auth_scheme = NULL;
+    int rdg_skip_authorization = 0;
+    int rdg_inject_sspi_ntlm = 0;
+    int rdg_downgrade_websocket = 0;
     int i;
+    if (proxy_msrpc_is_rdghttp_method(r)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP forwarding request line [%s %s HTTP/1.1]",
+                      r->method, r->method, url);
+        rdg_auth_scheme = apr_table_get(r->headers_in, "RDG-Auth-Scheme");
+        if (rdg_auth_scheme && !strcasecmp(rdg_auth_scheme, "SSPI_NTLM")) {
+            rdg_skip_authorization = 1;
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP SSPI_NTLM mode, suppressing Authorization header toward backend",
+                          r->method);
+        }
+        const char *rdg_upgrade = apr_table_get(r->headers_in, "Upgrade");
+        if (rdg_upgrade && !strcasecmp(rdg_upgrade, "websocket")) {
+            rdg_downgrade_websocket = 1;
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP WebSocket upgrade requested; downgrading upstream request to classic HTTP transport",
+                          r->method);
+        }
+    }
+
     for (i = 0; i < headers_in_array->nelts; i++) {
         if (!headers_in[i].key || !headers_in[i].val) {
             continue;
@@ -509,12 +601,54 @@ static int proxy_msrpc_send_request_headers(request_rec *r, char *url,
 
         if (!strcasecmp(headers_in[i].key, "Authorization")) {
             client_auth = headers_in[i].val;
+            if (rdg_skip_authorization) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                              "%s: RDGHTTP skipped request header [Authorization: %s]",
+                              r->method,
+                              proxy_msrpc_log_value(r, headers_in[i].key, headers_in[i].val));
+                continue;
+            }
+        }
+        if (rdg_downgrade_websocket &&
+            (!strcasecmp(headers_in[i].key, "Upgrade") ||
+             !strcasecmp(headers_in[i].key, "Connection") ||
+             !strncasecmp(headers_in[i].key, "Sec-WebSocket-", 14) ||
+             !strncasecmp(headers_in[i].key, "Sec-Websocket-", 14))) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP skipped WebSocket upgrade header [%s: %s]",
+                          r->method, headers_in[i].key,
+                          proxy_msrpc_log_value(r, headers_in[i].key, headers_in[i].val));
+            continue;
         }
 
         ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                       "%s: Sending HTTP request header line [%s: %s]", r->method, headers_in[i].key, headers_in[i].val);
+        if (proxy_msrpc_is_rdghttp_method(r)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP forwarding request header [%s: %s]",
+                          r->method, headers_in[i].key,
+                          proxy_msrpc_log_value(r, headers_in[i].key, headers_in[i].val));
+        }
 
         buf = apr_pstrcat(p, headers_in[i].key, ": ", headers_in[i].val, CRLF, NULL);
+        b = apr_bucket_pool_create(buf, strlen(buf), p, bb->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(bb, b);
+    }
+
+    if (rdg_downgrade_websocket) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP forwarding request header [Connection: Keep-Alive]",
+                      r->method);
+        buf = apr_pstrcat(p, "Connection: Keep-Alive" CRLF, NULL);
+        b = apr_bucket_pool_create(buf, strlen(buf), p, bb->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(bb, b);
+    }
+
+    if (rdg_inject_sspi_ntlm) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP forwarding request header [RDG-Auth-Scheme: SSPI_NTLM]",
+                      r->method);
+        buf = apr_pstrcat(p, "RDG-Auth-Scheme: SSPI_NTLM" CRLF, NULL);
         b = apr_bucket_pool_create(buf, strlen(buf), p, bb->bucket_alloc);
         APR_BRIGADE_INSERT_TAIL(bb, b);
     }
@@ -536,6 +670,82 @@ static int proxy_msrpc_send_request_headers(request_rec *r, char *url,
     APR_BRIGADE_INSERT_TAIL(bb, b);
 
     return proxy_msrpc_pass_brigade(bb->bucket_alloc, r, p_conn, origin, bb, 1);
+}
+
+static int proxy_msrpc_forward_request_body(request_rec *r,
+                                            apr_int64_t request_body_length,
+                                            apr_bucket_brigade *bb,
+                                            proxy_conn_rec *p_conn,
+                                            conn_rec *origin)
+{
+    apr_status_t rv;
+    apr_int64_t remaining = request_body_length;
+
+    while (remaining > 0) {
+        apr_off_t len = 0;
+        apr_size_t wanted = (remaining > CONN_BLKSZ) ? CONN_BLKSZ : (apr_size_t)remaining;
+
+        apr_brigade_cleanup(bb);
+        rv = ap_get_brigade(r->input_filters, bb, AP_MODE_READBYTES,
+                            APR_BLOCK_READ, wanted);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                          "%s: failed to read RDGHTTP request body",
+                          r->method);
+            return HTTP_BAD_REQUEST;
+        }
+
+        if (APR_BRIGADE_EMPTY(bb)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: short RDGHTTP request body, %lld bytes remaining",
+                          r->method, remaining);
+            return HTTP_BAD_REQUEST;
+        }
+
+        rv = apr_brigade_length(bb, 0, &len);
+        if (rv != APR_SUCCESS || len <= 0) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                          "%s: could not determine RDGHTTP request body length",
+                          r->method);
+            return HTTP_BAD_REQUEST;
+        }
+
+        if (len > remaining) {
+            apr_bucket *split = NULL;
+            rv = apr_brigade_partition(bb, remaining, &split);
+            if (rv != APR_SUCCESS) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                              "%s: failed to split RDGHTTP request body",
+                              r->method);
+                return HTTP_INTERNAL_SERVER_ERROR;
+            }
+            apr_bucket_brigade *extra = apr_brigade_split(bb, split);
+            rv = ap_save_brigade(r->input_filters, &bb, &extra, r->pool);
+            if (rv != APR_SUCCESS) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                              "%s: failed to save trailing RDGHTTP request body",
+                              r->method);
+                return HTTP_INTERNAL_SERVER_ERROR;
+            }
+            apr_brigade_destroy(extra);
+            len = remaining;
+        }
+
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                      "%s: forwarding %" APR_OFF_T_FMT
+                      " bytes of RDGHTTP request body",
+                      r->method, len);
+
+        rv = proxy_msrpc_pass_brigade(bb->bucket_alloc, r, p_conn, origin, bb, 1);
+        if (rv != OK) {
+            return rv;
+        }
+
+        remaining -= len;
+    }
+
+    apr_brigade_cleanup(bb);
+    return OK;
 }
 
 static int proxy_msrpc_send_pdu(request_rec *r, char *pdu, apr_off_t pdu_buflen,
@@ -654,8 +864,7 @@ int proxy_msrpc_tunnel(apr_pool_t *p, request_rec *r,
      * switch the Outlook Session to tunnel mode. This means for RPC_IN_DATA
      * requests we have to check the Outlook Session state, for RPC_OUT_DATA
      * we did this already before calling this function. */
-    int check_session_state = (r->method_number == msrpc_methods[MSRPC_M_DATA_IN] ||
-                               r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) ? 1 : 0;
+    int check_session_state = (r->method_number == msrpc_methods[MSRPC_M_DATA_IN]) ? 1 : 0;
     while (1) { /* Infinite loop until error (one side closes the connection) */
         apr_int32_t pollcnt;
         const apr_pollfd_t *signalled;
@@ -916,11 +1125,9 @@ static int proxy_msrpc_read_and_parse_initial_pdu(request_rec *r, proxy_msrpc_re
                   r->method, rdata->initial_pdu_offset, rdata->outlook_session);
 
     rv = HTTP_INTERNAL_SERVER_ERROR;
-    if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN] ||
-        r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) {
+    if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN]) {
         rv = proxy_msrpc_register_outlook_session(r, rdata);
-    } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT] ||
-               r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
+    } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT]) {
         rv = OK;
     }
     return rv;
@@ -952,6 +1159,11 @@ static int proxy_msrpc_read_server_response(request_rec *r, proxy_conn_rec *back
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_INFO, rv, r,
                       "%s: failed to read status line from server", r->method);
+        if (proxy_msrpc_is_rdghttp_method(r)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                          "%s: RDGHTTP failed to read status line from backend",
+                          r->method);
+        }
         return HTTP_BAD_GATEWAY;
     }
     rv = apr_brigade_flatten(bb, buf, &buf_len);
@@ -986,6 +1198,11 @@ static int proxy_msrpc_read_server_response(request_rec *r, proxy_conn_rec *back
     ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                   "%s: Got HTTP response status line (status code: %d)",
                   r->method, backend_status_code);
+    if (proxy_msrpc_is_rdghttp_method(r)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP server status line [%.*s] code=%d",
+                      r->method, (int)buf_len, buf, backend_status_code);
+    }
     r->status = backend_status_code;
     r->status_line = apr_pstrndup(r->pool, buf, buf_len);
 
@@ -1035,6 +1252,11 @@ static int proxy_msrpc_read_server_response(request_rec *r, proxy_conn_rec *back
                 if (!strcasecmp(buf, "WWW-Authenticate")) {
                     server_auth = proxy_msrpc_debug_auth_server(r, value, server_auth);
                 }
+                if (proxy_msrpc_is_rdghttp_method(r)) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                                  "%s: RDGHTTP response header [%s: %s]",
+                                  r->method, buf, value);
+                }
             } else {
                 expecting_response_headers = 0;
             }
@@ -1062,6 +1284,31 @@ static int proxy_msrpc_read_server_response(request_rec *r, proxy_conn_rec *back
                           r->method, header_value);
             return HTTP_INTERNAL_SERVER_ERROR;
         }
+    }
+    if (proxy_msrpc_is_rdghttp_method(r)) {
+        const char *transfer_encoding = apr_table_get(r->headers_out, "Transfer-Encoding");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP response parsed body_length=%ld transfer_encoding=%s",
+                      r->method, (long)body_length,
+                      transfer_encoding ? transfer_encoding : "-");
+        if (backend_status_code == HTTP_UNAUTHORIZED) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP advertising WWW-Authenticate: SSPI_NTLM to client",
+                          r->method);
+            apr_table_addn(r->headers_out, "WWW-Authenticate", "SSPI_NTLM");
+        }
+    }
+
+    const char *rdg_zero_body = apr_table_get(r->notes, "proxy-msrpc-rdg-out-zero-body");
+    if (rdg_zero_body && backend_status_code == HTTP_OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: normalizing RDGHTTP OUT 200 response framing to Content-Length: 0 before header flush",
+                      r->method);
+        apr_table_unset(r->headers_out, "Transfer-Encoding");
+        apr_table_unset(r->headers_out, "Content-Type");
+        apr_table_setn(r->headers_out, "Content-Length", "0");
+        body_length = 0;
+        r->clength = 0;
     }
 
     if (backend_status_code != HTTP_OK) {
@@ -1099,6 +1346,11 @@ static int proxy_msrpc_read_server_response(request_rec *r, proxy_conn_rec *back
                           "%s: Failed to read response body from server",
                           r->method);
             return HTTP_BAD_GATEWAY;
+        }
+        if (proxy_msrpc_is_rdghttp_method(r)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP read %ld response body bytes from server",
+                          r->method, (long)body_length);
         }
         r->clength = body_length;
         /* forward response body to the client */
@@ -1147,6 +1399,14 @@ static int proxy_msrpc_connect_backend(request_rec *r, const char *proxy_functio
         ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                       "%s: re-using already established connection 0x%pp to backend: %s",
                       r->method, d->conn, d->conn->hostname);
+        if (proxy_msrpc_is_rdghttp_method(r)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP reusing backend conn=0x%pp backend_conn=0x%pp host=%s close=%d keepalive=%d",
+                          r->method, d->conn, d->conn->connection,
+                          d->conn->hostname ? d->conn->hostname : "-",
+                          d->conn->close,
+                          d->conn->connection ? d->conn->connection->keepalive : -1);
+        }
         *backendp = d->conn;
         return OK;
     }
@@ -1162,6 +1422,11 @@ static int proxy_msrpc_connect_backend(request_rec *r, const char *proxy_functio
     ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                   "%s: acquired backend connection 0x%pp",
                   r->method, backend);
+    if (proxy_msrpc_is_rdghttp_method(r)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP acquired backend conn=0x%pp",
+                      r->method, backend);
+    }
 
     backend->is_ssl = is_ssl;
 
@@ -1229,6 +1494,14 @@ static int proxy_msrpc_connect_backend(request_rec *r, const char *proxy_functio
                           ssl_hostname);
         }
     }
+    if (proxy_msrpc_is_rdghttp_method(r)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP backend ready conn=0x%pp backend_conn=0x%pp host=%s close=%d keepalive=%d",
+                      r->method, backend, backend->connection,
+                      backend->hostname ? backend->hostname : "-",
+                      backend->close,
+                      backend->connection ? backend->connection->keepalive : -1);
+    }
 
     /* Step four: Register backend connection with client connection
      *            This ensures that the backend connection is closed too
@@ -1266,6 +1539,7 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
     apr_bucket_brigade *server_bb = NULL;
     const char *proxy_function = "HTTP";
     int is_ssl = 0;
+    int close_client_connection = 1;
     apr_pool_t *p = r->pool;
 
     proxy_msrpc_conf_t *msrpc_conf;
@@ -1277,45 +1551,44 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
         return DECLINED;
     }
 
+    int is_rdghttp = proxy_msrpc_is_rdghttp_method(r);
+
     /* does the method number match? */
-    if ((r->method_number != msrpc_methods[MSRPC_M_DATA_IN]) &&
-        (r->method_number != msrpc_methods[MSRPC_M_DATA_OUT]) &&
-        (r->method_number != msrpc_methods[MSRPC_M_RDG_IN]) &&
-        (r->method_number != msrpc_methods[MSRPC_M_RDG_OUT])) {
+    if (!is_rdghttp &&
+        (r->method_number != msrpc_methods[MSRPC_M_DATA_IN]) &&
+        (r->method_number != msrpc_methods[MSRPC_M_DATA_OUT])) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining due to bad method: %s", r->method);
         return DECLINED;
     }
-
-    /* does the user agent match? */
-    const char *request_user_agent = apr_table_get(r->headers_in, "User-Agent");
-    if (!request_user_agent) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining due to missing User-Agent header");
-        return DECLINED;
-    } else {
-        int found = 0;
-        if (!msrpc_conf->user_agents) {
-            /* if no user agent explicitly configured, check protocol-native defaults */
-            if (!strcasecmp(request_user_agent, "MSRPC")) {
-                found = 1;
-            } else if ((r->method_number == msrpc_methods[MSRPC_M_RDG_IN] ||
-                        r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) &&
-                       !strcasecmp(request_user_agent, "MS-RDGateway/1.0")) {
-                found = 1;
-            }
+		
+    if (!is_rdghttp) {
+        /* does the user agent match? */
+        const char *request_user_agent = apr_table_get(r->headers_in, "User-Agent");
+        if (!request_user_agent) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining due to missing User-Agent header");
+            return DECLINED;
         } else {
-            /* otherwise iterate through list of configured user agents */
-            const char **configured_user_agent = (const char **)msrpc_conf->user_agents->elts;
-            int i;
-            for (i = 0; i < msrpc_conf->user_agents->nelts; i++) {
-                if (!strcasecmp(request_user_agent, configured_user_agent[i])) {
+            int found = 0;
+            if (!msrpc_conf->user_agents) {
+                /* if no user agent explicitly configured, check for the default user agent */
+                if (!strcasecmp(request_user_agent, "MSRPC")) {
                     found = 1;
-                    break;
+                }
+            } else {
+                /* otherwise iterate through list of configured user agents */
+                const char **configured_user_agent = (const char **)msrpc_conf->user_agents->elts;
+                int i;
+                for (i = 0; i < msrpc_conf->user_agents->nelts; i++) {
+                    if (!strcasecmp(request_user_agent, configured_user_agent[i])) {
+                        found = 1;
+                        break;
+                    }
                 }
             }
-        }
-        if (!found) {
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining due to bad User-Agent: %s", request_user_agent);
-            return DECLINED;
+            if (!found) {
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining due to bad User-Agent: %s", request_user_agent);
+                return DECLINED;
+            }
         }
     }
 
@@ -1370,8 +1643,76 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
                       r->method, worker->cp->addr, worker->s->hostname);
         return status;
     }
-
+	
     server_bb = apr_brigade_create(backend->connection->pool, backend->connection->bucket_alloc);
+    if (is_rdghttp) {
+        const char *rdg_te = apr_table_get(r->headers_in, "Transfer-Encoding");
+        const char *rdg_conn = apr_table_get(r->headers_in, "Connection");
+        const char *rdg_conn_id = apr_table_get(r->headers_in, "RDG-Connection-Id");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP branch entered uri=%s content_length=%ld transfer_encoding=%s connection=%s rdg_connection_id=%s",
+                      r->method, r->unparsed_uri, (long)request_body_length,
+                      rdg_te ? rdg_te : "-",
+                      rdg_conn ? rdg_conn : "-",
+                      rdg_conn_id ? rdg_conn_id : "-");
+        backend->close = 0;
+        backend->connection->keepalive = AP_CONN_KEEPALIVE;
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: allowing RDGHTTP backend keepalive for auth/tunnel setup",
+                      r->method);
+
+        proxy_msrpc_request_data_t *rdata = apr_pcalloc(r->pool, sizeof(proxy_msrpc_request_data_t));
+        rdata->server_bb = server_bb;
+        rdata->client_bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+
+        char *rdg_locurl = apr_pstrdup(r->pool, r->unparsed_uri);
+        status = proxy_msrpc_send_request_headers(r, rdg_locurl, server_bb,
+                                                  backend, backend->connection);
+        if (status != OK) {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                          "%s: failed to forward RDGHTTP request headers to %pI (%s)",
+                          r->method, worker->cp->addr, worker->s->hostname);
+            goto cleanup;
+        }
+
+        if (request_body_length > 0) {
+            status = proxy_msrpc_forward_request_body(r, request_body_length,
+                                                      server_bb, backend,
+                                                      backend->connection);
+            if (status != OK) {
+                ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                              "%s: failed to forward RDGHTTP request body to %pI (%s)",
+                              r->method, worker->cp->addr, worker->s->hostname);
+                goto cleanup;
+            }
+        }
+
+        if (r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
+            apr_table_setn(r->notes, "proxy-msrpc-rdg-out-zero-body", "1");
+        }
+        status = proxy_msrpc_read_server_response(r, backend, server_bb);
+        apr_table_unset(r->notes, "proxy-msrpc-rdg-out-zero-body");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "%s: RDGHTTP backend response status=%d", r->method, status);
+        if (status == HTTP_OK || status == HTTP_SWITCHING_PROTOCOLS) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                          "%s: RDGHTTP backend accepted request with HTTP status %d, starting tunnel",
+                          r->method, status);
+            proxy_msrpc_remove_reqtimeout(r->input_filters);
+            status = proxy_msrpc_tunnel(p, r, rdata, backend);
+        } else if (status == HTTP_UNAUTHORIZED) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: preserving RDGHTTP backend auth connection after 401",
+                          r->method);
+            return OK;
+        } else {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "%s: RDGHTTP backend failed with HTTP status %d, closing client connection",
+                          r->method, status);
+        }
+        goto cleanup;
+    }
+
     if (request_body_length == 0) {
         /* forward initial HTTP request without MSRPC payload */
         status = proxy_msrpc_send_request_headers(r, locurl, server_bb,
@@ -1419,14 +1760,13 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
         if (status != OK) {
             goto cleanup;
         }
-        /* body length of OUT channel requests needs to match PDU length */
-        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT] ||
-            r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
+        /* body length of RPC_OUT_DATA requests needs to match PDU length */
+        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT]) {
             if (rdata->body_length != rdata->initial_pdu_offset) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                              "MSRPC PDU length %llu of %s request "
+                              "MSRPC PDU length %llu of RPC_OUT_DATA request "
                               "does not match request body length %lld",
-                              rdata->initial_pdu_offset, r->method, rdata->body_length);
+                              rdata->initial_pdu_offset, rdata->body_length);
                 return HTTP_BAD_REQUEST;
             }
         }
@@ -1481,12 +1821,11 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
                       "%s: initial PDU successfully sent to server %pI (%s)",
                       r->method, worker->cp->addr, worker->s->hostname);
 
-        /* synchronize IN/OUT channel requests (RPC_IN_DATA/RDG_IN_DATA waits for OUT channel) */
+        /* synchronize with RPC_DATA_IN request */
         // TODO: Replace hard-coded path by something configuration depending
         char *sync_key = apr_pstrcat(r->pool, "/tmp/msrpc_tunnel_", rdata->outlook_session, ".sync", NULL);
 
-        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT] ||
-            r->method_number == msrpc_methods[MSRPC_M_RDG_OUT]) {
+        if (r->method_number == msrpc_methods[MSRPC_M_DATA_OUT]) {
             /* Wait for "HTTP/1.1 200 OK" message from server */
             // TODO: proxy_msrpc_read_server_response() should NOT send data to the client so we can
             //       return propper HTTP errors when backend server was ok and 'we' failed. See below
@@ -1531,8 +1870,7 @@ static int proxy_msrpc_handler(request_rec *r, proxy_worker *worker,
                    with the 'cleanup' label. */
                 break;
             }
-        } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN] ||
-                   r->method_number == msrpc_methods[MSRPC_M_RDG_IN]) {
+        } else if (r->method_number == msrpc_methods[MSRPC_M_DATA_IN]) {
             int8_t sync_state = msrpc_sync_wait(sync_key, 5000);
             if (sync_state == SESSION_TUNNEL) {
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
@@ -1580,11 +1918,17 @@ cleanup:
         ap_proxy_release_connection(proxy_function, backend, r->server);
     }
 
-    /* if something went wrong we should also close the client connection, otherwise Outlook will hang idle. */
-    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r, "%s: setting keepalive from %d to AP_CONN_CLOSE", r->method, r->connection->keepalive);
-    r->connection->keepalive = AP_CONN_CLOSE;
-    apr_socket_close(ap_get_conn_socket(r->connection));
-    r->connection->aborted = 1;
+    if (close_client_connection) {
+        /* if something went wrong we should also close the client connection, otherwise Outlook will hang idle. */
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r, "%s: setting keepalive from %d to AP_CONN_CLOSE", r->method, r->connection->keepalive);
+        r->connection->keepalive = AP_CONN_CLOSE;
+        apr_socket_close(ap_get_conn_socket(r->connection));
+        r->connection->aborted = 1;
+    } else {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "%s: preserving client connection after forwarded RDGHTTP response",
+                      r->method);
+    }
 
     return status;
 }
